@@ -279,6 +279,8 @@ $(BUILD)/bin/testsimplexml: $(BUILD)/obj/testsimplexml.o $(LIBS3_STATIC)
 # Check target
 
 check:
+distdir:
+dist:
 
 # --------------------------------------------------------------------------
 # Clean target
