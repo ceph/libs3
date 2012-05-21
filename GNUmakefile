@@ -154,8 +154,14 @@ exported: libs3 s3 headers
 # --------------------------------------------------------------------------
 # Install target
 
+# adding empty install target, don't want to install anything when integrated
+# with ceph
 .PHONY: install
-install: exported
+install:
+
+# this is the original install target
+.PHONY: install-all
+install-all: exported
 	$(QUIET_ECHO) $(DESTDIR)/bin/s3: Installing executable
 	$(VERBOSE_SHOW) install -Dps -m u+rwx,go+rx $(BUILD)/bin/s3 \
                     $(DESTDIR)/bin/s3
