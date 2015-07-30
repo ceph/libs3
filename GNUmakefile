@@ -137,7 +137,8 @@ CFLAGS += -Wall -Werror -Wshadow -Wextra -Iinc \
           -DLIBS3_VER=\"$(LIBS3_VER)\" \
           -D__STRICT_ANSI__ \
           -D_ISOC99_SOURCE \
-          -D_POSIX_C_SOURCE=200112L
+          -D_POSIX_C_SOURCE=200112L \
+	  -fPIC
 
 LDFLAGS = $(CURL_LIBS) $(LIBXML2_LIBS) -lpthread
 
