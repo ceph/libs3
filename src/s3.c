@@ -29,6 +29,7 @@
  * calls to libs3 functions, and prints the results.
  **/
 
+#define _XOPEN_SOURCE 500
 #include <ctype.h>
 #include <getopt.h>
 #include <stdio.h>
@@ -367,6 +368,7 @@ typedef struct growbuffer
 // returns nonzero on success, zero on out of memory
 static int growbuffer_append(growbuffer **gb, const char *data, int dataLen)
 {
+    int toCopy = 0 ;
     while (dataLen) {
         growbuffer *buf = *gb ? (*gb)->prev : 0;
         if (!buf || (buf->size == sizeof(buf->data))) {
@@ -388,7 +390,7 @@ static int growbuffer_append(growbuffer **gb, const char *data, int dataLen)
             }
         }
 
-        int toCopy = (sizeof(buf->data) - buf->size);
+        toCopy = (sizeof(buf->data) - buf->size);
         if (toCopy > dataLen) {
             toCopy = dataLen;
         }
@@ -398,7 +400,7 @@ static int growbuffer_append(growbuffer **gb, const char *data, int dataLen)
         buf->size += toCopy, data += toCopy, dataLen -= toCopy;
     }
 
-    return 1;
+    return toCopy;
 }
 
 
@@ -1392,6 +1394,59 @@ static int putObjectDataCallback(int bufferSize, char *buffer,
     return ret;
 }
 
+#define MULTIPART_CHUNK_SIZE (15<<20) //multipart is 15M
+
+typedef struct UploadManager{
+    //used for initial multipart
+    char * upload_id;
+
+    //used for upload part object
+    char **etags;
+    int next_etags_pos;
+
+    //used for commit Upload
+    growbuffer *gb;
+    int remaining;
+} UploadManager;    
+
+typedef struct MultipartPartData {
+    put_object_callback_data put_object_data;
+    int seq;
+    UploadManager * manager;
+} MultipartPartData;
+
+
+S3Status initial_multipart_callback(const char * upload_id, void * callbackData) {
+    UploadManager *manager = (UploadManager *) callbackData;
+    manager->upload_id = strdup(upload_id);
+    return S3StatusOK;
+}
+
+
+S3Status MultipartResponseProperiesCallback(const S3ResponseProperties *properties, void *callbackData) {
+
+    responsePropertiesCallback(properties, callbackData);
+    MultipartPartData * data = (MultipartPartData*) callbackData;
+    int seq = data->seq;
+    const char *etag = properties->eTag;
+    data->manager->etags[seq - 1] = strdup(etag);
+    data->manager->next_etags_pos = seq;
+    return S3StatusOK;
+}
+
+
+static int multipartPutXmlCallback(int bufferSize, char *buffer, void *callbackData) {
+    UploadManager * manager = (UploadManager*)callbackData;
+    int ret = 0;
+    if (manager->remaining) {
+            int toRead = ((manager->remaining > bufferSize) ?
+                          bufferSize : manager->remaining);
+                growbuffer_read(&(manager->gb), toRead, &ret, buffer);
+    }
+    manager->remaining -= ret;
+    return ret;
+}
+
 
 static void put_object(int argc, char **argv, int optindex)
 {
@@ -1600,33 +1655,132 @@ static void put_object(int argc, char **argv, int optindex)
         metaPropertiesCount,
         metaProperties
     };
+    
+    if (contentLength <= MULTIPART_CHUNK_SIZE) {
+        S3PutObjectHandler putObjectHandler =
+        {
+            { &responsePropertiesCallback, &responseCompleteCallback },
+            &putObjectDataCallback
+        };
 
-    S3PutObjectHandler putObjectHandler =
-    {
-        { &responsePropertiesCallback, &responseCompleteCallback },
-        &putObjectDataCallback
-    };
+        do {
+            S3_put_object(&bucketContext, key, contentLength, &putProperties, 0,
+                          &putObjectHandler, &data);
+        } while (S3_status_is_retryable(statusG) && should_retry());
 
-    do {
-        S3_put_object(&bucketContext, key, contentLength, &putProperties, 0,
-                      &putObjectHandler, &data);
-    } while (S3_status_is_retryable(statusG) && should_retry());
+        if (data.infile) {
+            fclose(data.infile);
+        }
+        else if (data.gb) {
+            growbuffer_destroy(data.gb);
+        }
 
-    if (data.infile) {
-        fclose(data.infile);
+        if (statusG != S3StatusOK) {
+            printError();
+        }
+        else if (data.contentLength) {
+            fprintf(stderr, "\nERROR: Failed to read remaining %llu bytes from "
+                    "input\n", (unsigned long long) data.contentLength);
+        }
     }
-    else if (data.gb) {
-        growbuffer_destroy(data.gb);
-    }
+    else {
+        UploadManager manager;
 
-    if (statusG != S3StatusOK) {
-        printError();
-    }
-    else if (data.contentLength) {
-        fprintf(stderr, "\nERROR: Failed to read remaining %llu bytes from "
-                "input\n", (unsigned long long) data.contentLength);
-    }
+        manager.upload_id = 0;
+        manager.gb = 0;
 
+        //div round up
+        int seq;
+        int totalSeq = (contentLength + MULTIPART_CHUNK_SIZE- 1)/ MULTIPART_CHUNK_SIZE;
+
+        MultipartPartData partData;
+        int partContentLength = 0;
+
+        manager.etags = (char**)malloc(sizeof(char*) * totalSeq);
+        manager.next_etags_pos = 0;
+
+        S3MultipartInitialHander handler =
+        {
+            {
+                &responsePropertiesCallback,
+                &responseCompleteCallback
+            },
+            &initial_multipart_callback    
+        };
+
+        do {
+            S3_multipart_initial(&bucketContext,key,0, &handler,0, &manager);
+        } while (S3_status_is_retryable(statusG) && should_retry());
+        if (manager.upload_id == 0 || statusG != S3StatusOK) {
+            printError();
+            goto clean;
+        }
+
+        S3PutObjectHandler putObjectHandler = 
+        {
+            {&MultipartResponseProperiesCallback, &responseCompleteCallback },
+            &putObjectDataCallback
+        };
+
+        for(seq = 1 ; seq <= totalSeq ; seq ++) {
+            memset(&partData, 0, sizeof(MultipartPartData));
+            partData.manager = &manager;
+            partData.seq = seq;
+            partData.put_object_data = data;
+            partContentLength = (contentLength > MULTIPART_CHUNK_SIZE)?MULTIPART_CHUNK_SIZE:contentLength;
+            printf("Sending Part Seq %d, length=%d\n", seq, partContentLength);
+            partData.put_object_data.contentLength = partContentLength;
+            putProperties.md5 = 0;
+            do {
+                S3_multipart_upload_part(&bucketContext, key, &putProperties, &putObjectHandler, seq, manager.upload_id, partContentLength,0, &partData);
+            } while (S3_status_is_retryable(statusG) && should_retry());
+            if (statusG != S3StatusOK) {
+                printError();
+                goto clean;
+            }
+            contentLength -= MULTIPART_CHUNK_SIZE;
+        }
+       
+        int i;
+
+        S3MultipartCommitHandler commit_handler = {
+            {
+                    &responsePropertiesCallback,&responseCompleteCallback
+            },
+            &multipartPutXmlCallback,
+            0
+        };
+
+        int size = 0;
+        size += growbuffer_append(&(manager.gb), "<CompleteMultipartUpload>", strlen("<CompleteMultipartUpload>"));
+        char buf[256];
+        int n;
+        for(i=0;i<totalSeq;i++) {
+            n = snprintf(buf,256,"<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>",
+                            i + 1,manager.etags[i]);
+            size += growbuffer_append(&(manager.gb), buf, n);
+        }
+        size += growbuffer_append(&(manager.gb), "</CompleteMultipartUpload>",strlen("</CompleteMultipartUpload>"));
+        manager.remaining = size;
+
+        do {
+            S3_multipart_commit(&bucketContext, key, &commit_handler, manager.upload_id, manager.remaining, 0,  &manager); 
+        } while (S3_status_is_retryable(statusG) && should_retry());
+        if (statusG != S3StatusOK) {
+            printError();
+            goto clean;
+        }
+
+    clean:
+        if(manager.upload_id)
+            free(manager.upload_id);
+        for(i=0;i<manager.next_etags_pos;i++) {
+            free(manager.etags[i]);
+        }
+        growbuffer_destroy(manager.gb);
+        free(manager.etags);
+    }
+    
     S3_deinitialize();
 }
 

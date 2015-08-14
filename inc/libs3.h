@@ -1013,6 +1013,13 @@ typedef S3Status (S3GetObjectDataCallback)(int bufferSize, const char *buffer,
                                            void *callbackData);
                                        
 
+
+typedef S3Status (S3MultipartCommitResponseCallback)(const char * location, const char * etag, void * callbackData);
+
+
+
+typedef S3Status (S3MultipartInitialResponseCallback)(const char * upload_id, void * callbackData);
+
 /** **************************************************************************
  * Callback Structures
  ************************************************************************** **/
@@ -1122,6 +1129,33 @@ typedef struct S3GetObjectHandler
      **/
     S3GetObjectDataCallback *getObjectDataCallback;
 } S3GetObjectHandler;
+
+
+typedef struct S3MultipartInitialHander {
+    /**
+     * responseHandler provides the properties and complete callback
+     **/
+    S3ResponseHandler responseHandler;
+
+    S3MultipartInitialResponseCallback *responseXmlCallback;
+} S3MultipartInitialHander;
+
+typedef struct S3MultipartCommitHandler
+{
+    /**
+     * responseHandler provides the properties and complete callback
+     **/
+    S3ResponseHandler responseHandler;
+
+    /**
+     * The putObjectDataCallback is called to acquire data to send to S3 as
+     * the contents of the put_object request.  It is made repeatedly until it
+     * returns a negative number (indicating that the request should be
+     * aborted), or 0 (indicating that all data has been supplied).
+     **/
+    S3PutObjectDataCallback *putObjectDataCallback;
+    S3MultipartCommitResponseCallback *responseXmlCallback;
+} S3MultipartCommitHandler;
 
 
 /** **************************************************************************
@@ -1884,6 +1918,14 @@ void S3_set_server_access_logging(const S3BucketContext *bucketContext,
                                   const S3ResponseHandler *handler,
                                   void *callbackData);
                                   
+
+//TODO
+
+void S3_multipart_initial(S3BucketContext *bucketContext, const char *key, S3PutProperties *putProperties, S3MultipartInitialHander *handler, S3RequestContext * requestContext, void * callbackData); 
+
+void S3_multipart_upload_part(S3BucketContext *bucketContext, const char *key, S3PutProperties * putProperties, S3PutObjectHandler *handler, int seq, const char * upload_id, int partContentLength, S3RequestContext * requestContext, void* callbackData);
+
+void S3_multipart_commit(S3BucketContext *bucketContext, const char *key, S3MultipartCommitHandler *handler, const char * upload_id, int contentLength, S3RequestContext * requestContext, void* callbackData);
 
 #ifdef __cplusplus
 }
